@@ -1,74 +1,69 @@
 # dbus-shelly-uni-temperature
-Integrate Shelly Uni temperature into Victron Energies Venus OS
 
-## Purpose
-With the scripts in this repo it should be easy possible to install, uninstall, restart a service that connects the Shelly Uni to the VenusOS and GX devices from Victron.
-Used @vikt0rm dbus-shelly-1pm-pvinverter as a starting point for this. Linked below.
+Publish Shelly Uni DS18B20 probes as Victron Venus OS temperature devices.
 
+## What it does
 
-## Inspiration
-This project is my first on GitHub and with the Victron Venus OS, so I took some ideas and approaches from the following projects - many thanks for sharing the knowledge:
-- https://github.com/vikt0rm/dbus-shelly-1pm-pvinverter
-- https://github.com/fabian-lauer/dbus-shelly-3em-smartmeter
-- https://shelly-api-docs.shelly.cloud/gen1/#shelly1-shelly1pm
-- https://github.com/victronenergy/venus/wiki/dbus#pv-inverters
+The driver is a daemontools service. It reads `http://<host>/status` once per Uni (not once per probe), then publishes each enabled `[DEVICE*]` section as:
 
-## How it works
--- todo
-
-### Details / Process
-As mentioned above the script is inspired by @fabian-lauer dbus-shelly-3em-smartmeter implementation.
-So what is the script doing:
-- Running as a service
-- connecting to DBus of the Venus OS `com.victronenergy.pvinverter.http_{DeviceInstanceID_from_config}`
-- After successful DBus connection Shelly 1PM is accessed via REST-API - simply the /status is called and a JSON is returned with all details
-  A sample JSON file from Shelly 1PM can be found [here](docs/shelly1pm-status-sample.json)
-- Serial/MAC is taken from the response as device serial
-- Paths are added to the DBus with default value 0 - including some settings like name, etc
-- After that a "loop" is started which pulls Shelly 1PM data every 750ms from the REST-API and updates the values in the DBus
-
-Thats it 😄
-
-### Pictures
-
-
-## Install & Configuration
-### Get the code
-Just grap a copy of the main branche and copy them to a folder under `/data/` e.g. `/data/dbus-shelly-1pm-pvinverter`.
-After that call the install.sh script.
-
-The following script should do everything for you:
 ```
-wget https://github.com/tmlarsson/dbus-shelly-uni-temperature/archive/refs/heads/main.zip
-unzip main.zip "dbus-shelly-uni-temperature-main/*" -d /data
-mv /data/dbus-shelly-uni-temperature-main /data/dbus-shelly-uni-temperature
+com.victronenergy.temperature.http_<Deviceinstance>
+```
+
+with `/Temperature` in °C and `/Connected` 0/1.
+
+## Config
+
+Copy values in `config.ini` on the GX (`/data/dbus-shelly-uni-temperature/config.ini`).
+
+| Section | Key | Meaning |
+|---|---|---|
+| `DEVICEn` | `Enabled` | `1` to publish this probe, `0` to skip |
+| `DEVICEn` | `Host` | Shelly Uni IP/hostname |
+| `DEVICEn` | `ProbeNumber` | Index in `ext_temperature` (`0`, `1`, `2`) |
+| `DEVICEn` | `Deviceinstance` | Unique Venus instance (becomes `http_66`, etc.) |
+| `DEVICEn` | `CustomName` | Name in Remote Console |
+| `DEVICEn` | `TemperatureType` | Victron type (default `2` = generic) |
+| `DEVICEn` | `SignOfLifeLog` | Minutes between info log lines |
+| `ONPREMISE` | `Username` / `Password` | Optional HTTP basic auth |
+| `ONPREMISE` | `PollIntervalSeconds` | How often to poll (default 15, minimum 5) |
+
+Several DEVICE sections may share one `Host`. Missing probes are logged once and show as disconnected instead of spamming the log.
+
+## Install
+
+On the GX (root SSH):
+
+```bash
+wget -O /tmp/shelly-uni.zip https://github.com/tmlarsson/dbus-shelly-uni-temperature/archive/refs/heads/main.zip
+unzip /tmp/shelly-uni.zip -d /tmp
+# Keep live settings if this is an update
+if [ -f /data/dbus-shelly-uni-temperature/config.ini ]; then
+  cp /data/dbus-shelly-uni-temperature/config.ini /tmp/shelly-uni-config.ini
+fi
+mkdir -p /data/dbus-shelly-uni-temperature
+cp -R /tmp/dbus-shelly-uni-temperature-main/. /data/dbus-shelly-uni-temperature/
+if [ -f /tmp/shelly-uni-config.ini ]; then
+  cp /tmp/shelly-uni-config.ini /data/dbus-shelly-uni-temperature/config.ini
+fi
 chmod a+x /data/dbus-shelly-uni-temperature/install.sh
 /data/dbus-shelly-uni-temperature/install.sh
-rm main.zip
 ```
-⚠️ Check configuration after that - because service is already installed an running and with wrong connection data (host, username, pwd) you will spam the log-file
 
-### Change config.ini
-Within the project there is a file `/data/dbus-shelly-1pm-pvinverter/config.ini` - just change the values - most important is the deviceinstance, custom name and phase under "DEFAULT" and host, username and password in section "ONPREMISE". More details below:
+Edit `config.ini` after a first install, then restart. Updates keep the existing `config.ini`.
 
-| Section  | Config vlaue | Explanation |
-| ------------- | ------------- | ------------- |
-| DEFAULT  | AccessType | Fixed value 'OnPremise' |
-| DEFAULT  | SignOfLifeLog  | Time in minutes how often a status is added to the log-file `current.log` with log-level INFO |
-| DEFAULT  | Deviceinstance | Unique ID identifying the shelly 1pm in Venus OS |
-| DEFAULT  | CustomName | Name shown in Remote Console (e.g. name of pv inverter) |
-| ONPREMISE  | Host | IP or hostname of on-premise Shelly 3EM web-interface |
-| ONPREMISE  | Username | Username for htaccess login - leave blank if no username/password required |
-| ONPREMISE  | Password | Password for htaccess login - leave blank if no username/password required |
+## Restart / uninstall / logs
 
+```bash
+/data/dbus-shelly-uni-temperature/restart.sh
+/data/dbus-shelly-uni-temperature/uninstall.sh
+tail -n 100 -f /var/log/dbus-shelly-uni-temperature/current | tai64nlocal
+```
 
+On some Venus images `/var/log` is the same as `/data/log`.
 
-## Used documentation
-- https://github.com/victronenergy/venus/wiki/dbus#pv-inverters   DBus paths for Victron namespace
-- https://github.com/victronenergy/venus/wiki/dbus-api   DBus API from Victron
-- https://www.victronenergy.com/live/ccgx:root_access   How to get root access on GX device/Venus OS
-- https://shelly-api-docs.shelly.cloud/gen1/#shelly1-shelly1pm Shelly API documentation
+## Docs
 
-## Discussions on the web
-This module/repository has been posted on the following threads:
-- https://community.victronenergy.com/questions/127339/shelly-1pm-as-pv-inverter-in-venusos.html
+- [Venus D-Bus temperature](https://github.com/victronenergy/venus/wiki/dbus#temperature)
+- [Shelly Gen1 status](https://shelly-api-docs.shelly.cloud/gen1/#shelly-uni)
+- [GX root access](https://www.victronenergy.com/live/ccgx:root_access)
