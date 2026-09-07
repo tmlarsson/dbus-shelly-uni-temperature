@@ -37,23 +37,30 @@ On the GX (root SSH):
 ```bash
 wget -O /tmp/shelly-uni.zip https://github.com/tmlarsson/dbus-shelly-uni-temperature/archive/refs/heads/main.zip
 unzip /tmp/shelly-uni.zip -d /tmp
-rm -rf /data/dbus-shelly-uni-temperature
-cp -R /tmp/dbus-shelly-uni-temperature-main /data/dbus-shelly-uni-temperature
+# Keep live settings if this is an update
+if [ -f /data/dbus-shelly-uni-temperature/config.ini ]; then
+  cp /data/dbus-shelly-uni-temperature/config.ini /tmp/shelly-uni-config.ini
+fi
+mkdir -p /data/dbus-shelly-uni-temperature
+cp -R /tmp/dbus-shelly-uni-temperature-main/. /data/dbus-shelly-uni-temperature/
+if [ -f /tmp/shelly-uni-config.ini ]; then
+  cp /tmp/shelly-uni-config.ini /data/dbus-shelly-uni-temperature/config.ini
+fi
 chmod a+x /data/dbus-shelly-uni-temperature/install.sh
 /data/dbus-shelly-uni-temperature/install.sh
 ```
 
-Edit `config.ini` after install, then restart.
+Edit `config.ini` after a first install, then restart. Updates keep the existing `config.ini`.
 
 ## Restart / uninstall / logs
 
 ```bash
 /data/dbus-shelly-uni-temperature/restart.sh
 /data/dbus-shelly-uni-temperature/uninstall.sh
-tail -n 100 -f /data/log/dbus-shelly-uni-temperature/current | tai64nlocal
+tail -n 100 -f /var/log/dbus-shelly-uni-temperature/current | tai64nlocal
 ```
 
-If that log path is empty, try `/var/log/dbus-shelly-uni-temperature/current`.
+On some Venus images `/var/log` is the same as `/data/log`.
 
 ## Docs
 

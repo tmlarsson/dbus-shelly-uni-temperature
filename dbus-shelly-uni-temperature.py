@@ -11,25 +11,23 @@ import dbus
 import requests
 from gi.repository import GLib
 
-sys.path.insert(
-    1,
-    os.path.join(
-        os.path.dirname(__file__),
-        "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python",
-    ),
-)
+sys.path.insert(1, "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python")
 from vedbus import VeDbusService
 
 from shelly_status import (
+    HostFailureTracker,
+    clamp_poll_seconds,
+    clamp_sign_of_life_minutes,
     group_services_by_host,
-    probe_temperature_c,
+    http_auth,
+    probe_connection,
     shelly_firmware,
     shelly_serial,
     status_url,
 )
 
-DEFAULT_POLL_SECONDS = 15
 HTTP_TIMEOUT_SECONDS = 5
+_sessions = {}
 
 
 class SystemBus(dbus.bus.BusConnection):
@@ -58,9 +56,21 @@ def _config_bool(section, key, default=True):
     return section.get(key).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _session_for_host(host):
+    session = _sessions.get(host)
+    if session is None:
+        session = requests.Session()
+        _sessions[host] = session
+    return session
+
+
 def fetch_shelly_status(host, username="", password=""):
-    url = status_url(host, username, password)
-    response = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+    url = status_url(host)
+    response = _session_for_host(host).get(
+        url,
+        timeout=HTTP_TIMEOUT_SECONDS,
+        auth=http_auth(username, password),
+    )
     response.raise_for_status()
     data = response.json()
     if not data:
@@ -68,8 +78,19 @@ def fetch_shelly_status(host, username="", password=""):
     return data
 
 
+def require_on_premise(config):
+    access_type = "OnPremise"
+    for section in config.sections():
+        value = config[section].get("AccessType")
+        if value:
+            access_type = value
+            break
+    if access_type != "OnPremise":
+        raise ValueError("AccessType %s is not supported" % access_type)
+
+
 class DbusShellyUniService:
-    def __init__(self, config, section, paths, productname="Shelly Uni"):
+    def __init__(self, config, section, productname="Shelly Uni"):
         self._config = config
         self._section = section
         self.host = config[section]["Host"].strip()
@@ -80,7 +101,6 @@ class DbusShellyUniService:
 
         service_name = "com.victronenergy.temperature.http_{:02d}".format(deviceinstance)
         self._dbusservice = VeDbusService(service_name, dbusconnection(), register=False)
-        self._paths = paths
         self._missing_probe_logged = False
         self._lastUpdate = 0
 
@@ -101,39 +121,25 @@ class DbusShellyUniService:
         self._dbusservice.add_path("/DeviceInstance", deviceinstance)
         self._dbusservice.add_path("/ProductId", 0xFFFF)
         self._dbusservice.add_path("/ProductName", productname)
-        self._dbusservice.add_path("/CustomName", customname)
+        self._dbusservice.add_path("/CustomName", customname, writeable=True)
         self._dbusservice.add_path("/Connected", 0)
         self._dbusservice.add_path("/FirmwareVersion", "")
         self._dbusservice.add_path("/HardwareVersion", 0)
         self._dbusservice.add_path("/Serial", "")
         self._dbusservice.add_path("/UpdateIndex", 0)
-
-        for path, settings in self._paths.items():
-            self._dbusservice.add_path(
-                path,
-                settings["initial"],
-                gettextcallback=settings["textformat"],
-                writeable=True,
-                onchangecallback=self._handlechangedvalue,
-            )
-        self._dbusservice["/TemperatureType"] = temperature_type
+        self._dbusservice.add_path(
+            "/Temperature",
+            None,
+            gettextcallback=lambda p, v: "" if v is None else (str(round(v, 2)) + "°C"),
+            writeable=False,
+        )
+        self._dbusservice.add_path("/TemperatureType", temperature_type, writeable=False)
         self._dbusservice.register()
 
     def apply_status(self, status):
-        if not status:
-            self._dbusservice["/Connected"] = 0
-            return
-
-        serial = shelly_serial(status)
-        firmware = shelly_firmware(status)
-        if serial:
-            self._dbusservice["/Serial"] = serial
-        if firmware:
-            self._dbusservice["/FirmwareVersion"] = firmware
-
-        temperature = probe_temperature_c(status, self._probe_number)
-        if temperature is None:
-            if not self._missing_probe_logged:
+        connected, temperature = probe_connection(status, self._probe_number)
+        if not connected:
+            if status and not self._missing_probe_logged:
                 logging.warning(
                     "%s: Shelly %s has no ext_temperature probe %s",
                     self._section,
@@ -142,9 +148,16 @@ class DbusShellyUniService:
                 )
                 self._missing_probe_logged = True
             self._dbusservice["/Connected"] = 0
+            self._dbusservice["/Temperature"] = None
             return
 
         self._missing_probe_logged = False
+        serial = shelly_serial(status)
+        firmware = shelly_firmware(status)
+        if serial:
+            self._dbusservice["/Serial"] = serial
+        if firmware:
+            self._dbusservice["/FirmwareVersion"] = firmware
         self._dbusservice["/Temperature"] = temperature
         self._dbusservice["/Connected"] = 1
         index = self._dbusservice["/UpdateIndex"] + 1
@@ -153,10 +166,6 @@ class DbusShellyUniService:
         self._dbusservice["/UpdateIndex"] = index
         self._lastUpdate = time.time()
 
-    def _handlechangedvalue(self, path, value):
-        logging.debug("someone else updated %s to %s", path, value)
-        return True
-
 
 class ShellyUniDriver:
     def __init__(self, config, services):
@@ -164,40 +173,41 @@ class ShellyUniDriver:
         self._services = services
         self._username = config["ONPREMISE"].get("Username", "")
         self._password = config["ONPREMISE"].get("Password", "")
+        self._failures = HostFailureTracker()
 
     def poll_interval_ms(self):
         raw = None
         if self._config.has_option("ONPREMISE", "PollIntervalSeconds"):
             raw = self._config["ONPREMISE"]["PollIntervalSeconds"]
-        try:
-            seconds = int(raw) if raw else DEFAULT_POLL_SECONDS
-        except ValueError:
-            seconds = DEFAULT_POLL_SECONDS
-        return max(5, seconds) * 1000
+        return clamp_poll_seconds(raw) * 1000
 
     def sign_of_life_ms(self):
-        minutes = 5
+        raw = None
         for service in self._services:
-            value = service._config[service._section].get("SignOfLifeLog")
-            if value:
-                minutes = int(value)
+            raw = service._config[service._section].get("SignOfLifeLog")
+            if raw:
                 break
-        return max(1, minutes) * 60 * 1000
+        return clamp_sign_of_life_minutes(raw) * 60 * 1000
 
     def tick(self):
         grouped = group_services_by_host(self._services)
-        statuses = {}
         for host, host_services in grouped.items():
             try:
-                statuses[host] = fetch_shelly_status(
-                    host, self._username, self._password
-                )
+                status = fetch_shelly_status(host, self._username, self._password)
+                outcome = self._failures.note(host, True)
+                if outcome == "recovered":
+                    logging.info("Shelly Uni at %s recovered", host)
             except Exception:
-                logging.exception("Failed to read Shelly Uni at %s", host)
-                statuses[host] = None
+                outcome = self._failures.note(host, False)
+                if outcome == "first":
+                    logging.exception("Failed to read Shelly Uni at %s", host)
+                else:
+                    logging.warning("Shelly Uni at %s still unreachable", host)
+                status = None
             for service in host_services:
-                service.apply_status(statuses[host])
-        return True
+                service.apply_status(status)
+        GLib.timeout_add(self.poll_interval_ms(), self.tick)
+        return False
 
     def sign_of_life(self):
         logging.info("--- sign of life ---")
@@ -225,7 +235,7 @@ def main():
     DBusGMainLoop(set_as_default=True)
 
     config = get_config()
-    _c = lambda p, v: "" if v is None else (str(round(v, 2)) + "°C")
+    require_on_premise(config)
 
     services = []
     for section in config.sections():
@@ -234,16 +244,7 @@ def main():
         if not _config_bool(config[section], "Enabled", True):
             logging.info("Skipping %s (Enabled=0)", section)
             continue
-        services.append(
-            DbusShellyUniService(
-                config=config,
-                section=section,
-                paths={
-                    "/Temperature": {"initial": None, "textformat": _c},
-                    "/TemperatureType": {"initial": 2, "textformat": str},
-                },
-            )
-        )
+        services.append(DbusShellyUniService(config=config, section=section))
 
     if not services:
         logging.error("No enabled DEVICE sections in config.ini")
@@ -251,7 +252,6 @@ def main():
 
     driver = ShellyUniDriver(config, services)
     driver.tick()
-    GLib.timeout_add(driver.poll_interval_ms(), driver.tick)
     GLib.timeout_add(driver.sign_of_life_ms(), driver.sign_of_life)
 
     logging.info(
