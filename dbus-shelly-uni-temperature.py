@@ -79,7 +79,7 @@ class DbusShellyUniService:
         temperature_type = int(config[section].get("TemperatureType", 2))
 
         service_name = "com.victronenergy.temperature.http_{:02d}".format(deviceinstance)
-        self._dbusservice = VeDbusService(service_name, dbusconnection())
+        self._dbusservice = VeDbusService(service_name, dbusconnection(), register=False)
         self._paths = paths
         self._missing_probe_logged = False
         self._lastUpdate = 0
@@ -117,6 +117,7 @@ class DbusShellyUniService:
                 onchangecallback=self._handlechangedvalue,
             )
         self._dbusservice["/TemperatureType"] = temperature_type
+        self._dbusservice.register()
 
     def apply_status(self, status):
         if not status:
