@@ -1,19 +1,36 @@
-import platform
+#!/usr/bin/env python3
+
 import logging
-import sys
 import os
+import platform
+import sys
 import time
-import requests
+
 import configparser
 import dbus
+import requests
+from gi.repository import GLib
 
-if sys.version_info.major == 2:
-    import gobject
-else:
-    from gi.repository import GLib as gobject
-
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
+sys.path.insert(
+    1,
+    os.path.join(
+        os.path.dirname(__file__),
+        "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python",
+    ),
+)
 from vedbus import VeDbusService
+
+from shelly_status import (
+    group_services_by_host,
+    probe_temperature_c,
+    shelly_firmware,
+    shelly_serial,
+    status_url,
+)
+
+DEFAULT_POLL_SECONDS = 15
+HTTP_TIMEOUT_SECONDS = 5
+
 
 class SystemBus(dbus.bus.BusConnection):
     def __new__(cls):
@@ -26,176 +43,220 @@ class SessionBus(dbus.bus.BusConnection):
 
 
 def dbusconnection():
-    return SessionBus() if 'DBUS_SESSION_BUS_ADDRESS' in os.environ else SystemBus()
+    return SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else SystemBus()
 
 
-def getConfig():
+def get_config():
     config = configparser.ConfigParser()
-    config.read("%s/config.ini" % (os.path.dirname(os.path.realpath(__file__))))
+    config.read(os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.ini"))
     return config
 
 
+def _config_bool(section, key, default=True):
+    if key not in section:
+        return default
+    return section.get(key).strip().lower() in ("1", "true", "yes", "on")
+
+
+def fetch_shelly_status(host, username="", password=""):
+    url = status_url(host, username, password)
+    response = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
+    if not data:
+        raise ValueError("Empty JSON from %s" % host)
+    return data
+
+
 class DbusShellyUniService:
-    def __init__(self, config, section, paths, productname='Shelly Uni', connection='Shelly Uni HTTP JSON service'):
+    def __init__(self, config, section, paths, productname="Shelly Uni"):
         self._config = config
         self._section = section
-        deviceinstance = int(config[section]['Deviceinstance'])
-        customname = config[section]['CustomName']
-        self._probe_number = int(config[section]['ProbeNumber'])
+        self.host = config[section]["Host"].strip()
+        self._probe_number = int(config[section]["ProbeNumber"])
+        deviceinstance = int(config[section]["Deviceinstance"])
+        customname = config[section]["CustomName"]
+        temperature_type = int(config[section].get("TemperatureType", 2))
 
-        # Use a unique service name and object path for each instance
         service_name = "com.victronenergy.temperature.http_{:02d}".format(deviceinstance)
         self._dbusservice = VeDbusService(service_name, dbusconnection())
         self._paths = paths
-
-        logging.info("%s /DeviceInstance = %d" % (section, deviceinstance))
-
-        # Create the management objects, as specified in the ccgx dbus-api document
-        self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
-        self._dbusservice.add_path('/Mgmt/ProcessVersion', 'Unknown version, and running on Python ' + platform.python_version())
-        self._dbusservice.add_path('/Mgmt/Connection', connection)
-
-        # Create the mandatory objects
-        self._dbusservice.add_path('/DeviceInstance', deviceinstance)
-        self._dbusservice.add_path('/ProductId', 0xFFFF)
-        self._dbusservice.add_path('/ProductName', productname)
-        self._dbusservice.add_path('/CustomName', customname)
-        self._dbusservice.add_path('/Connected', 1)
-        self._dbusservice.add_path('/FirmwareVersion', self._getShellyFWVersion())
-        self._dbusservice.add_path('/HardwareVersion', 0)
-        self._dbusservice.add_path('/Serial', self._getShellySerial())
-        self._dbusservice.add_path('/UpdateIndex', 0)
-
-        # Add the additional paths
-        for path, settings in self._paths.items():
-            self._dbusservice.add_path(path, settings['initial'], gettextcallback=settings['textformat'], writeable=True, onchangecallback=self._handlechangedvalue)
-
-        # Last update
+        self._missing_probe_logged = False
         self._lastUpdate = 0
 
-        # Add _update function 'timer'
-        gobject.timeout_add(60 * 1000, self._update)  # pause 1 minute before the next request // no need for anything faster
+        logging.info(
+            "%s instance=%s probe=%s host=%s",
+            section,
+            deviceinstance,
+            self._probe_number,
+            self.host,
+        )
 
-        # Add _signOfLife 'timer' to get feedback in log every 15minutes
-        gobject.timeout_add(self._getSignOfLifeInterval() * 15 * 60 * 1000, self._signOfLife)
+        self._dbusservice.add_path("/Mgmt/ProcessName", __file__)
+        self._dbusservice.add_path(
+            "/Mgmt/ProcessVersion",
+            "Unknown version, and running on Python " + platform.python_version(),
+        )
+        self._dbusservice.add_path("/Mgmt/Connection", "Shelly Uni HTTP JSON service")
+        self._dbusservice.add_path("/DeviceInstance", deviceinstance)
+        self._dbusservice.add_path("/ProductId", 0xFFFF)
+        self._dbusservice.add_path("/ProductName", productname)
+        self._dbusservice.add_path("/CustomName", customname)
+        self._dbusservice.add_path("/Connected", 0)
+        self._dbusservice.add_path("/FirmwareVersion", "")
+        self._dbusservice.add_path("/HardwareVersion", 0)
+        self._dbusservice.add_path("/Serial", "")
+        self._dbusservice.add_path("/UpdateIndex", 0)
 
-    def _getShellySerial(self):
-        meter_data = self._getShellyData()
-        if not meter_data['mac']:
-            raise ValueError("Response does not contain 'mac' attribute")
-        serial = meter_data['mac']
-        return serial
+        for path, settings in self._paths.items():
+            self._dbusservice.add_path(
+                path,
+                settings["initial"],
+                gettextcallback=settings["textformat"],
+                writeable=True,
+                onchangecallback=self._handlechangedvalue,
+            )
+        self._dbusservice["/TemperatureType"] = temperature_type
 
-    def _getShellyFWVersion(self):
-        meter_data = self._getShellyData()
-        if not meter_data['update']['old_version']:
-            raise ValueError("Response does not contain 'update/old_version' attribute")
-        ver = meter_data['update']['old_version']
-        return ver
+    def apply_status(self, status):
+        if not status:
+            self._dbusservice["/Connected"] = 0
+            return
 
-    def _getSignOfLifeInterval(self):
-        value = self._config[self._section]['SignOfLifeLog']
-        if not value:
-            value = 0
-        return int(value)
+        serial = shelly_serial(status)
+        firmware = shelly_firmware(status)
+        if serial:
+            self._dbusservice["/Serial"] = serial
+        if firmware:
+            self._dbusservice["/FirmwareVersion"] = firmware
 
-    def _getShellyStatusUrl(self):
-        accessType = self._config[self._section]['AccessType']
-        if accessType == 'OnPremise':
-            URL = "http://%s:%s@%s/status" % (self._config['ONPREMISE']['Username'], self._config['ONPREMISE']['Password'], self._config[self._section]['Host'])
-            URL = URL.replace(":@", "")
-        else:
-            raise ValueError("AccessType %s is not supported" % (self._config[self._section]['AccessType']))
-        return URL
+        temperature = probe_temperature_c(status, self._probe_number)
+        if temperature is None:
+            if not self._missing_probe_logged:
+                logging.warning(
+                    "%s: Shelly %s has no ext_temperature probe %s",
+                    self._section,
+                    self.host,
+                    self._probe_number,
+                )
+                self._missing_probe_logged = True
+            self._dbusservice["/Connected"] = 0
+            return
 
-    def _getShellyData(self):
-        URL = self._getShellyStatusUrl()
-        uni_r = requests.get(url=URL)
-        if not uni_r:
-            raise ConnectionError("No response from Shelly Uni - %s" % (URL))
-        uni_data = uni_r.json()
-        if not uni_data:
-            raise ValueError("Converting response to JSON failed")
-        return uni_data
-
-    def _signOfLife(self):
-        logging.info("--- Start: sign of life ---")
-        logging.info("Last _update() call: %s" % (self._lastUpdate))
-        logging.info("Last '/Temperature': %s" % (self._dbusservice['/Temperature']))
-        logging.info("--- End: sign of life ---")
-        return True
-
-    def _update(self):
-        try:
-            meter_data = self._getShellyData()
-            probe_number = str(self._probe_number)
-            logging.info("Probe number: %s" % (probe_number))
-            
-            if 'ext_temperature' not in meter_data:
-                logging.error("Response does not contain 'ext_temperature' attribute")
-                return True
-
-            if probe_number not in meter_data['ext_temperature']:
-                logging.error("Response does not contain probe number %s in 'ext_temperature'", probe_number)
-                return True
-
-            temperature = meter_data['ext_temperature'][probe_number]['tC']
-            self._dbusservice['/Temperature'] = temperature
-            logging.debug("Temperature: %s, with probe %s" % (self._dbusservice['/Temperature'], probe_number))
-
-            index = self._dbusservice['/UpdateIndex'] + 1
-            if index > 255:
-                index = 0
-            self._dbusservice['/UpdateIndex'] = index
-
-            self._lastUpdate = time.time()
-        except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
-        return True
-
+        self._missing_probe_logged = False
+        self._dbusservice["/Temperature"] = temperature
+        self._dbusservice["/Connected"] = 1
+        index = self._dbusservice["/UpdateIndex"] + 1
+        if index > 255:
+            index = 0
+        self._dbusservice["/UpdateIndex"] = index
+        self._lastUpdate = time.time()
 
     def _handlechangedvalue(self, path, value):
-        logging.debug("someone else updated %s to %s" % (path, value))
+        logging.debug("someone else updated %s to %s", path, value)
+        return True
+
+
+class ShellyUniDriver:
+    def __init__(self, config, services):
+        self._config = config
+        self._services = services
+        self._username = config["ONPREMISE"].get("Username", "")
+        self._password = config["ONPREMISE"].get("Password", "")
+
+    def poll_interval_ms(self):
+        raw = None
+        if self._config.has_option("ONPREMISE", "PollIntervalSeconds"):
+            raw = self._config["ONPREMISE"]["PollIntervalSeconds"]
+        try:
+            seconds = int(raw) if raw else DEFAULT_POLL_SECONDS
+        except ValueError:
+            seconds = DEFAULT_POLL_SECONDS
+        return max(5, seconds) * 1000
+
+    def sign_of_life_ms(self):
+        minutes = 5
+        for service in self._services:
+            value = service._config[service._section].get("SignOfLifeLog")
+            if value:
+                minutes = int(value)
+                break
+        return max(1, minutes) * 60 * 1000
+
+    def tick(self):
+        grouped = group_services_by_host(self._services)
+        statuses = {}
+        for host, host_services in grouped.items():
+            try:
+                statuses[host] = fetch_shelly_status(
+                    host, self._username, self._password
+                )
+            except Exception:
+                logging.exception("Failed to read Shelly Uni at %s", host)
+                statuses[host] = None
+            for service in host_services:
+                service.apply_status(statuses[host])
+        return True
+
+    def sign_of_life(self):
+        logging.info("--- sign of life ---")
+        for service in self._services:
+            logging.info(
+                "%s connected=%s temperature=%s last_update=%s",
+                service._section,
+                service._dbusservice["/Connected"],
+                service._dbusservice["/Temperature"],
+                service._lastUpdate,
+            )
         return True
 
 
 def main():
-    logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S',
-                        level=logging.INFO,
-                        handlers=[
-                            logging.FileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__)))),
-                            logging.StreamHandler()
-                        ])
+    logging.basicConfig(
+        format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+        handlers=[logging.StreamHandler()],
+    )
 
-    try:
-        logging.info("Start")
+    from dbus.mainloop.glib import DBusGMainLoop
 
-        from dbus.mainloop.glib import DBusGMainLoop
-        DBusGMainLoop(set_as_default=True)
+    DBusGMainLoop(set_as_default=True)
 
-        config = getConfig()
+    config = get_config()
+    _c = lambda p, v: "" if v is None else (str(round(v, 2)) + "°C")
 
-        _c = lambda p, v: (str(round(v, 2)) + '°C')
+    services = []
+    for section in config.sections():
+        if not section.startswith("DEVICE"):
+            continue
+        if not _config_bool(config[section], "Enabled", True):
+            logging.info("Skipping %s (Enabled=0)", section)
+            continue
+        services.append(
+            DbusShellyUniService(
+                config=config,
+                section=section,
+                paths={
+                    "/Temperature": {"initial": None, "textformat": _c},
+                    "/TemperatureType": {"initial": 2, "textformat": str},
+                },
+            )
+        )
 
-        # Initialize services for each device
-        services = []
-        for section in config.sections():
-            if section.startswith('DEVICE'):
-                service = DbusShellyUniService(
-                    config=config,
-                    section=section,
-                    paths={
-                        '/Temperature': {'initial': None, 'textformat': _c},
-                        '/TemperatureType': {'initial': 2, 'textformat': str},
-                    })
-                services.append(service)
+    if not services:
+        logging.error("No enabled DEVICE sections in config.ini")
+        sys.exit(1)
 
-        logging.info('Connected to dbus, and switching over to gobject.MainLoop() (= event based)')
-        mainloop = gobject.MainLoop()
-        mainloop.run()
-    except Exception as e:
-        logging.critical('Error at %s', 'main', exc_info=e)
+    driver = ShellyUniDriver(config, services)
+    driver.tick()
+    GLib.timeout_add(driver.poll_interval_ms(), driver.tick)
+    GLib.timeout_add(driver.sign_of_life_ms(), driver.sign_of_life)
+
+    logging.info(
+        "Connected to dbus, polling every %ss", driver.poll_interval_ms() // 1000
+    )
+    GLib.MainLoop().run()
 
 
 if __name__ == "__main__":
