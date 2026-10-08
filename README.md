@@ -1,10 +1,12 @@
 # dbus-shelly-uni-temperature
 
-Publish Shelly Uni DS18B20 probes as Victron Venus OS temperature devices.
+Publish Shelly temperature probes as Victron Venus OS temperature devices.
+
+A Shelly Uni is read from `http://<host>/status`. A Shelly Pill is read from `Shelly.GetComponents` on the Gen3 RPC API. Several `[DEVICE*]` sections may share one host; that host is polled once.
 
 ## What it does
 
-The driver is a daemontools service. It reads `http://<host>/status` once per Uni (not once per probe), then publishes each enabled `[DEVICE*]` section as:
+The driver is a daemontools service. It publishes each enabled `[DEVICE*]` section as:
 
 ```
 com.victronenergy.temperature.http_<Deviceinstance>
@@ -19,8 +21,9 @@ Copy values in `config.ini` on the GX (`/data/dbus-shelly-uni-temperature/config
 | Section | Key | Meaning |
 |---|---|---|
 | `DEVICEn` | `Enabled` | `1` to publish this probe, `0` to skip |
-| `DEVICEn` | `Host` | Shelly Uni IP/hostname |
-| `DEVICEn` | `ProbeNumber` | Index in `ext_temperature` (`0`, `1`, `2`) |
+| `DEVICEn` | `Host` | Shelly IP/hostname |
+| `DEVICEn` | `ProbeNumber` | Uni only. Index in `ext_temperature` (`0`, `1`, `2`), or leave this out and set `ProbeId` to the DS18B20 `hwID` |
+| `DEVICEn` | `ProbeId` | Pill component id (`200`, `201`, …). If the payload includes a OneWire `addr`, that address can be used instead. The Pill `name` is not an id |
 | `DEVICEn` | `Deviceinstance` | Unique Venus instance (becomes `http_66`, etc.) |
 | `DEVICEn` | `CustomName` | Name in Remote Console |
 | `DEVICEn` | `TemperatureType` | Victron type (default `2` = generic) |

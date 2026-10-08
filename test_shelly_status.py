@@ -7,8 +7,15 @@ from shelly_status import (
     clamp_sign_of_life_minutes,
     group_services_by_host,
     http_auth,
+    lookup_probe,
+    pill_components_url,
+    pill_firmware,
+    pill_info_url,
+    pill_serial,
     probe_connection,
     probe_temperature_c,
+    probes_from_pill,
+    probes_from_uni,
     shelly_firmware,
     shelly_serial,
     status_url,
@@ -49,6 +56,63 @@ class ProbeTests(unittest.TestCase):
         connected, temperature = probe_connection(SAMPLE, 0)
         self.assertEqual(connected, 1)
         self.assertAlmostEqual(temperature, 43.75)
+
+
+PILL = {
+    "components": [
+        {
+            "key": "temperature:200",
+            "status": {"id": 200, "tC": 40.2, "tF": 104.5},
+            "config": {"id": 200, "name": "A1", "addr": "28:aa:bb:cc:dd:ee:ff:01"},
+        },
+        {
+            "key": "temperature:201",
+            "status": {"id": 201, "tC": None, "errors": ["read"]},
+            "config": {"id": 201, "name": "A2"},
+        },
+    ]
+}
+
+
+class PillTests(unittest.TestCase):
+    def test_reads_component_id_not_name(self):
+        probes = probes_from_pill(PILL)
+        connected, temperature = lookup_probe(probes, "200")
+        self.assertEqual(connected, 1)
+        self.assertAlmostEqual(temperature, 40.2)
+        self.assertNotIn("A1", probes)
+
+    def test_read_error_is_disconnected(self):
+        probes = probes_from_pill(PILL)
+        connected, temperature = lookup_probe(probes, 201)
+        self.assertEqual(connected, 0)
+        self.assertIsNone(temperature)
+
+    def test_also_indexes_onewire_address_when_present(self):
+        probes = probes_from_pill(PILL)
+        connected, temperature = lookup_probe(probes, "28:aa:bb:cc:dd:ee:ff:01")
+        self.assertEqual(connected, 1)
+        self.assertAlmostEqual(temperature, 40.2)
+
+    def test_uni_hwid_is_indexed(self):
+        probes = probes_from_uni(SAMPLE)
+        self.assertAlmostEqual(probes["0"], 43.75)
+        self.assertAlmostEqual(probes["aaa"], 43.75)
+
+    def test_pill_urls_have_no_credentials(self):
+        self.assertEqual(
+            pill_components_url("shellypill.local"),
+            "http://shellypill.local/rpc/Shelly.GetComponents?dynamic_only=true",
+        )
+        self.assertEqual(
+            pill_info_url("shellypill.local"),
+            "http://shellypill.local/rpc/Shelly.GetDeviceInfo",
+        )
+
+    def test_pill_serial_and_firmware(self):
+        info = {"mac": "907069452A50", "ver": "2.0.1"}
+        self.assertEqual(pill_serial(info), "907069452A50")
+        self.assertEqual(pill_firmware(info), "2.0.1")
 
 
 class MetaTests(unittest.TestCase):

@@ -20,7 +20,13 @@ from shelly_status import (
     clamp_sign_of_life_minutes,
     group_services_by_host,
     http_auth,
-    probe_connection,
+    lookup_probe,
+    pill_components_url,
+    pill_firmware,
+    pill_info_url,
+    pill_serial,
+    probes_from_pill,
+    probes_from_uni,
     shelly_firmware,
     shelly_serial,
     status_url,
@@ -64,8 +70,7 @@ def _session_for_host(host):
     return session
 
 
-def fetch_shelly_status(host, username="", password=""):
-    url = status_url(host)
+def fetch_json(host, url, username="", password=""):
     response = _session_for_host(host).get(
         url,
         timeout=HTTP_TIMEOUT_SECONDS,
@@ -76,6 +81,22 @@ def fetch_shelly_status(host, username="", password=""):
     if not data:
         raise ValueError("Empty JSON from %s" % host)
     return data
+
+
+def snapshot_from_uni(status):
+    return {
+        "probes": probes_from_uni(status),
+        "serial": shelly_serial(status),
+        "firmware": shelly_firmware(status),
+    }
+
+
+def snapshot_from_pill(components, info):
+    return {
+        "probes": probes_from_pill(components),
+        "serial": pill_serial(info),
+        "firmware": pill_firmware(info),
+    }
 
 
 def require_on_premise(config):
@@ -90,11 +111,19 @@ def require_on_premise(config):
 
 
 class DbusShellyUniService:
-    def __init__(self, config, section, productname="Shelly Uni"):
+    def __init__(self, config, section, productname=None):
         self._config = config
         self._section = section
         self.host = config[section]["Host"].strip()
-        self._probe_number = int(config[section]["ProbeNumber"])
+        probe_id = config[section].get("ProbeId")
+        if probe_id is not None and str(probe_id).strip():
+            self.kind = "pill"
+            self.probe_id = str(probe_id).strip()
+        else:
+            self.kind = "uni"
+            self.probe_id = str(int(config[section]["ProbeNumber"]))
+        if productname is None:
+            productname = "Shelly Pill" if self.kind == "pill" else "Shelly Uni"
         deviceinstance = int(config[section]["Deviceinstance"])
         customname = config[section]["CustomName"]
         temperature_type = int(config[section].get("TemperatureType", 2))
@@ -105,10 +134,11 @@ class DbusShellyUniService:
         self._lastUpdate = 0
 
         logging.info(
-            "%s instance=%s probe=%s host=%s",
+            "%s instance=%s kind=%s probe=%s host=%s",
             section,
             deviceinstance,
-            self._probe_number,
+            self.kind,
+            self.probe_id,
             self.host,
         )
 
@@ -117,7 +147,12 @@ class DbusShellyUniService:
             "/Mgmt/ProcessVersion",
             "Unknown version, and running on Python " + platform.python_version(),
         )
-        self._dbusservice.add_path("/Mgmt/Connection", "Shelly Uni HTTP JSON service")
+        connection = (
+            "Shelly Pill HTTP JSON service"
+            if self.kind == "pill"
+            else "Shelly Uni HTTP JSON service"
+        )
+        self._dbusservice.add_path("/Mgmt/Connection", connection)
         self._dbusservice.add_path("/DeviceInstance", deviceinstance)
         self._dbusservice.add_path("/ProductId", 0xFFFF)
         self._dbusservice.add_path("/ProductName", productname)
@@ -136,15 +171,16 @@ class DbusShellyUniService:
         self._dbusservice.add_path("/TemperatureType", temperature_type, writeable=False)
         self._dbusservice.register()
 
-    def apply_status(self, status):
-        connected, temperature = probe_connection(status, self._probe_number)
+    def apply_status(self, snapshot):
+        probes = None if not snapshot else snapshot.get("probes")
+        connected, temperature = lookup_probe(probes, self.probe_id)
         if not connected:
-            if status and not self._missing_probe_logged:
+            if snapshot and not self._missing_probe_logged:
                 logging.warning(
-                    "%s: Shelly %s has no ext_temperature probe %s",
+                    "%s: Shelly %s has no reading for probe %s",
                     self._section,
                     self.host,
-                    self._probe_number,
+                    self.probe_id,
                 )
                 self._missing_probe_logged = True
             self._dbusservice["/Connected"] = 0
@@ -152,8 +188,8 @@ class DbusShellyUniService:
             return
 
         self._missing_probe_logged = False
-        serial = shelly_serial(status)
-        firmware = shelly_firmware(status)
+        serial = snapshot.get("serial")
+        firmware = snapshot.get("firmware")
         if serial:
             self._dbusservice["/Serial"] = serial
         if firmware:
@@ -189,23 +225,59 @@ class ShellyUniDriver:
                 break
         return clamp_sign_of_life_minutes(raw) * 60 * 1000
 
+    def _snapshot_for(self, host, kind):
+        if kind == "pill":
+            components = fetch_json(
+                host,
+                pill_components_url(host),
+                self._username,
+                self._password,
+            )
+            info = None
+            try:
+                info = fetch_json(
+                    host,
+                    pill_info_url(host),
+                    self._username,
+                    self._password,
+                )
+            except Exception:
+                logging.warning("Shelly Pill at %s did not return device info", host)
+            return snapshot_from_pill(components, info)
+        status = fetch_json(
+            host,
+            status_url(host),
+            self._username,
+            self._password,
+        )
+        return snapshot_from_uni(status)
+
     def tick(self):
         grouped = group_services_by_host(self._services)
         for host, host_services in grouped.items():
-            try:
-                status = fetch_shelly_status(host, self._username, self._password)
-                outcome = self._failures.note(host, True)
-                if outcome == "recovered":
-                    logging.info("Shelly Uni at %s recovered", host)
-            except Exception:
-                outcome = self._failures.note(host, False)
-                if outcome == "first":
-                    logging.exception("Failed to read Shelly Uni at %s", host)
-                else:
-                    logging.warning("Shelly Uni at %s still unreachable", host)
-                status = None
+            kinds = {service.kind for service in host_services}
+            if len(kinds) != 1:
+                logging.error(
+                    "Shelly %s mixes Uni and Pill probes; skipping this poll", host
+                )
+                snapshot = None
+            else:
+                kind = next(iter(kinds))
+                label = "Pill" if kind == "pill" else "Uni"
+                try:
+                    snapshot = self._snapshot_for(host, kind)
+                    outcome = self._failures.note(host, True)
+                    if outcome == "recovered":
+                        logging.info("Shelly %s at %s recovered", label, host)
+                except Exception:
+                    outcome = self._failures.note(host, False)
+                    if outcome == "first":
+                        logging.exception("Failed to read Shelly %s at %s", label, host)
+                    else:
+                        logging.warning("Shelly %s at %s still unreachable", label, host)
+                    snapshot = None
             for service in host_services:
-                service.apply_status(status)
+                service.apply_status(snapshot)
         GLib.timeout_add(self.poll_interval_ms(), self.tick)
         return False
 
